@@ -322,6 +322,20 @@ def guardrail():
         silent=True
     )
 
+    print(
+    "GRADER_REQUEST:",
+    {
+        "tool": data.get("tool") if isinstance(data, dict) else None,
+        "url": (
+            data.get("arguments", {}).get("url")
+            if isinstance(data, dict)
+            and isinstance(data.get("arguments"), dict)
+            else None
+        )
+    },
+    flush=True
+)
+
     if not isinstance(data, dict):
         return jsonify({
             "action": "block",
