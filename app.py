@@ -203,18 +203,18 @@ def validate_url(url):
         return False, "Invalid URL."
 
     try:
-
         parsed = urlparse(url)
 
-        # HTTPS only.
+        # HTTPS only
         if parsed.scheme.lower() != "https":
             return False, "Only HTTPS URLs are allowed."
 
-        # Reject userinfo tricks.
-        if (
-            parsed.username is not None
-            or parsed.password is not None
-        ):
+        # Block userinfo tricks:
+        # https://example.com@evil.com
+        if parsed.username is not None:
+            return False, "URL userinfo is blocked."
+
+        if parsed.password is not None:
             return False, "URL userinfo is blocked."
 
         hostname = parsed.hostname
@@ -224,7 +224,11 @@ def validate_url(url):
 
         hostname = hostname.lower().rstrip(".")
 
-        # Exact host match.
+        # EXACT hostname match.
+        # This does NOT allow:
+        # example.com.evil.com
+        # evil-example.com
+        # example.com@evil.com
         if hostname not in ALLOWED_HOSTS:
             return False, "Hostname is not allowed."
 
@@ -245,26 +249,67 @@ def fetch_safe_url(url):
     if not valid:
         return None, reason
 
+    current_url = url
+
     try:
 
-        response = requests.get(
-            url,
-            timeout=8,
-            allow_redirects=False,
-            headers={
-                "User-Agent": "Agent-Guardrail/1.0"
-            }
-        )
+        # Manually follow redirects so every destination
+        # can be checked against the allowlist.
+        for _ in range(5):
 
-        # Do not follow redirects automatically.
-        if 300 <= response.status_code < 400:
-            return None, "Redirects are blocked."
+            response = requests.get(
+                current_url,
+                timeout=8,
+                allow_redirects=False,
+                headers={
+                    "User-Agent": "Agent-Guardrail/1.0"
+                }
+            )
 
-        return response.text, None
+            # ------------------------------------------------
+            # Redirect
+            # ------------------------------------------------
+
+            if 300 <= response.status_code < 400:
+
+                location = response.headers.get(
+                    "Location"
+                )
+
+                if not location:
+                    return None, "Redirect has no destination."
+
+                # Convert relative redirects into absolute URLs.
+                next_url = urljoin(
+                    current_url,
+                    location
+                )
+
+                # IMPORTANT:
+                # Validate the redirect destination BEFORE
+                # making the next request.
+                valid, reason = validate_url(
+                    next_url
+                )
+
+                if not valid:
+                    return None, "Redirect destination is blocked."
+
+                current_url = next_url
+
+                continue
+
+            # ------------------------------------------------
+            # Normal response
+            # ------------------------------------------------
+
+            return response.text, None
+
+        return None, "Too many redirects."
 
     except requests.RequestException:
         return None, "Network request failed."
-
+        
 
 # ============================================================
 # MAIN GUARDRAIL ENDPOINT
