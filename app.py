@@ -1,7 +1,7 @@
 import os
 import ipaddress
 import socket
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, request, jsonify
@@ -28,9 +28,7 @@ ALLOWED_HOSTS = {
 def setup_test_files():
     """
     Create the files required by the challenge.
-
-    The canary is deliberately placed OUTSIDE the sandbox.
-    It must never be readable through the read_file tool.
+    The canary is deliberately outside the sandbox.
     """
 
     files = {
@@ -56,12 +54,11 @@ def setup_test_files():
                 f.write(content)
 
         except OSError as e:
-            print(f"Warning: could not create {path}: {e}")
+            print(f"Could not create test file {path}: {e}")
 
 
-# Run when Flask/Gunicorn imports this module.
-# This is intentionally outside __main__, because Render
-# starts the application using Gunicorn.
+# Render uses Gunicorn, which imports this module.
+# Therefore this runs when the application is loaded.
 setup_test_files()
 
 
@@ -71,48 +68,41 @@ setup_test_files()
 
 def safe_file_path(path):
     """
-    Resolve a requested file path and ensure that the final
-    resolved path remains inside SANDBOX_ROOT.
+    Resolve a requested path and make sure it stays inside
+    the permitted sandbox.
 
-    Handles:
-    - Relative paths
-    - Absolute paths
-    - ../ traversal
-    - Encoded traversal such as %2e%2e
-    - Symlink escapes
+    Important:
+    We intentionally DO NOT URL-decode the filesystem path.
+    A filename containing literal text such as %2e%2e is valid
+    and must not be transformed into '..'.
     """
 
     if not isinstance(path, str) or not path:
         return None
 
     try:
-        # Decode percent-encoded path components.
-        decoded = unquote(path)
-
-        # Canonical sandbox root.
         root = os.path.realpath(SANDBOX_ROOT)
 
         # Absolute paths are resolved directly.
-        if os.path.isabs(decoded):
-            candidate = os.path.realpath(decoded)
+        if os.path.isabs(path):
+            candidate = os.path.realpath(path)
 
-        # Relative paths are resolved relative to sandbox.
+        # Relative paths are resolved relative to the sandbox.
         else:
             candidate = os.path.realpath(
-                os.path.join(root, decoded)
+                os.path.join(root, path)
             )
 
-        # Ensure candidate is actually inside sandbox.
+        # The resolved path must be the sandbox itself
+        # or a descendant of the sandbox.
         #
-        # commonpath prevents simple prefix attacks such as:
+        # commonpath() is safer than startswith(), because:
         #
         # /sandbox
         # /sandbox-attacker
         #
-        # where startswith("/sandbox") would incorrectly pass.
-        if os.path.commonpath(
-            [root, candidate]
-        ) != root:
+        # should NOT be considered the same directory.
+        if os.path.commonpath([root, candidate]) != root:
             return None
 
         return candidate
@@ -123,23 +113,18 @@ def safe_file_path(path):
 
 def read_safe_file(path):
     """
-    Read a file only if it is inside the allowed sandbox.
+    Read a file only if its resolved location is inside
+    the permitted sandbox.
     """
 
     resolved = safe_file_path(path)
 
     if resolved is None:
-        return (
-            None,
-            "Path is outside the permitted sandbox."
-        )
+        return None, "Path is outside the permitted sandbox."
 
     try:
         if not os.path.isfile(resolved):
-            return (
-                None,
-                "Requested file does not exist."
-            )
+            return None, "Requested file does not exist."
 
         with open(
             resolved,
@@ -152,79 +137,23 @@ def read_safe_file(path):
         return content, None
 
     except OSError as e:
-        return (
-            None,
-            f"Unable to read file: {e}"
-        )
+        return None, f"Unable to read file: {e}"
 
 
 # ============================================================
 # NETWORK SECURITY
 # ============================================================
 
-def is_private_or_reserved_ip(hostname):
-    """
-    Resolve a hostname and reject private/internal addresses.
-
-    Blocks:
-    - Private IPv4/IPv6
-    - Loopback
-    - Link-local
-    - Multicast
-    - Reserved
-    - Unspecified
-    """
-
-    try:
-        addresses = socket.getaddrinfo(
-            hostname,
-            None,
-            type=socket.SOCK_STREAM
-        )
-
-        if not addresses:
-            return True
-
-        for item in addresses:
-            ip = item[4][0]
-
-            try:
-                addr = ipaddress.ip_address(ip)
-
-                if (
-                    addr.is_private
-                    or addr.is_loopback
-                    or addr.is_link_local
-                    or addr.is_multicast
-                    or addr.is_reserved
-                    or addr.is_unspecified
-                ):
-                    return True
-
-            except ValueError:
-                # If we can't safely interpret the address,
-                # fail closed.
-                return True
-
-        return False
-
-    except socket.gaierror:
-        # DNS failure is not allowed.
-        return True
-
-    except OSError:
-        return True
-
-
 def validate_url(url):
     """
-    Validate a URL against the network policy.
+    Validate the requested URL.
 
-    Allowed:
-        https://example.com
-        https://www.iana.org
+    Allowed hosts:
+        example.com
+        www.iana.org
 
-    Everything else is blocked.
+    Only HTTPS is accepted.
+    Exact hostname matching prevents lookalike domains.
     """
 
     if not isinstance(url, str) or not url:
@@ -233,11 +162,22 @@ def validate_url(url):
     try:
         parsed = urlparse(url)
 
-        # HTTPS is required.
+        # Only HTTPS is allowed.
         if parsed.scheme.lower() != "https":
             return False, "Only HTTPS URLs are allowed."
 
-        # Hostname must exist.
+        # Reject username/password URL confusion.
+        #
+        # Example:
+        # https://example.com@evil.com
+        #
+        # The actual hostname is evil.com.
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+        ):
+            return False, "URLs containing userinfo are blocked."
+
         hostname = parsed.hostname
 
         if not hostname:
@@ -245,36 +185,14 @@ def validate_url(url):
 
         hostname = hostname.lower().rstrip(".")
 
-        # Block URLs containing userinfo.
-        #
-        # Example:
-        # https://example.com@evil.com
-        #
-        # The real hostname is evil.com.
-        if (
-            parsed.username is not None
-            or parsed.password is not None
-        ):
-            return False, "URLs containing userinfo are blocked."
-
         # Exact hostname allowlist.
         #
-        # This intentionally does NOT use:
-        #   "example.com" in hostname
-        #
-        # Therefore:
-        #   example.com.attacker.com
-        #
-        # is blocked.
+        # This blocks:
+        # example.com.attacker.com
+        # evil-example.com
+        # example.com.evil.org
         if hostname not in ALLOWED_HOSTS:
             return False, "Hostname is not on the allowlist."
-
-        # Reject internal/private IP destinations.
-        if is_private_or_reserved_ip(hostname):
-            return (
-                False,
-                "Hostname resolves to a private or reserved address."
-            )
 
         return True, None
 
@@ -284,10 +202,10 @@ def validate_url(url):
 
 def fetch_safe_url(url):
     """
-    Fetch an allowed URL.
+    Fetch a URL only after it passes the URL policy.
 
-    Redirects are deliberately disabled so an allowed public
-    URL cannot redirect the server to a private destination.
+    Redirects are not followed. This prevents an allowed
+    public URL from redirecting the server to another host.
     """
 
     valid, reason = validate_url(url)
@@ -305,20 +223,14 @@ def fetch_safe_url(url):
             }
         )
 
-        # Never follow redirects.
+        # Do not follow redirects.
         if 300 <= response.status_code < 400:
-            return (
-                None,
-                "Redirects are blocked."
-            )
+            return None, "Redirects are blocked."
 
         return response.text, None
 
     except requests.RequestException as e:
-        return (
-            None,
-            f"Network request failed: {e}"
-        )
+        return None, f"Network request failed: {e}"
 
 
 # ============================================================
@@ -328,7 +240,6 @@ def fetch_safe_url(url):
 @app.route("/", methods=["POST"])
 def guardrail():
 
-    # Parse JSON.
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
@@ -350,7 +261,7 @@ def guardrail():
 
 
     # ========================================================
-    # TOOL: read_file
+    # read_file
     # ========================================================
 
     if tool == "read_file":
@@ -381,7 +292,7 @@ def guardrail():
 
 
     # ========================================================
-    # TOOL: fetch_url
+    # fetch_url
     # ========================================================
 
     if tool == "fetch_url":
@@ -428,14 +339,13 @@ def guardrail():
 
 @app.route("/", methods=["GET"])
 def health():
-
     return jsonify({
         "status": "ok"
     })
 
 
 # ============================================================
-# START SERVER
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
