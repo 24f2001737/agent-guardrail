@@ -1,12 +1,13 @@
 import os
-import ipaddress
 import socket
-from urllib.parse import urlparse
+import ipaddress
+from urllib.parse import urlparse, urljoin
 
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
 
 # ============================================================
 # CONFIGURATION
@@ -19,9 +20,11 @@ ALLOWED_HOSTS = {
     "www.iana.org",
 }
 
+MAX_REDIRECTS = 5
+
 
 # ============================================================
-# TEST FILE SETUP
+# CREATE REQUIRED FILES
 # ============================================================
 
 def setup_test_files():
@@ -46,28 +49,24 @@ def setup_test_files():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
 
-        except OSError as e:
-            print(f"Could not create {path}: {e}")
+        except Exception as e:
+            print(f"File setup error: {e}")
 
 
 setup_test_files()
 
 
 # ============================================================
-# FILE PATH SECURITY
+# FILE SECURITY
 # ============================================================
 
 def resolve_safe_path(path):
     """
-    Resolve a requested path and ensure it is physically located
-    inside SANDBOX_ROOT.
+    Resolve a path while enforcing the sandbox boundary.
 
-    Supports:
-    - relative paths
-    - absolute paths within sandbox
-    - normal filenames containing '..'
-    - real traversal attempts using '..'
-    - symlink escape protection
+    Important:
+    We do NOT URL-decode filesystem paths. Therefore a literal
+    filename containing %2e%2e remains a literal filename.
     """
 
     if not isinstance(path, str) or not path:
@@ -76,36 +75,25 @@ def resolve_safe_path(path):
     try:
         root = os.path.realpath(SANDBOX_ROOT)
 
-        # Normalize path separators.
-        # This handles Windows-style backslashes if they are
-        # supplied to the Linux service as path text.
-        normalized = path.replace("\\", "/")
+        # Normalize backslashes to forward slashes.
+        # This prevents alternate path syntax from bypassing
+        # the boundary on inputs containing Windows separators.
+        path = path.replace("\\", "/")
 
-        # If path is absolute, use it directly.
-        if normalized.startswith("/"):
-            candidate = os.path.realpath(normalized)
-
+        if os.path.isabs(path):
+            candidate = os.path.realpath(path)
         else:
-            # Relative paths are relative to the sandbox.
             candidate = os.path.realpath(
-                os.path.join(root, normalized)
+                os.path.join(root, path)
             )
 
-        # Security boundary:
-        # candidate must be root itself or a child of root.
-        try:
-            inside = os.path.commonpath(
-                [root, candidate]
-            ) == root
-        except ValueError:
-            inside = False
-
-        if not inside:
+        # Candidate must be root or a descendant of root.
+        if os.path.commonpath([root, candidate]) != root:
             return None
 
         return candidate
 
-    except Exception:
+    except (ValueError, OSError):
         return None
 
 
@@ -132,25 +120,69 @@ def read_safe_file(path):
 
 
 # ============================================================
-# URL SECURITY
+# NETWORK SECURITY
 # ============================================================
+
+def hostname_is_allowed(hostname):
+    if not hostname:
+        return False
+
+    hostname = hostname.lower().rstrip(".")
+
+    return hostname in ALLOWED_HOSTS
+
+
+def hostname_resolves_to_private(hostname):
+    """
+    Reject destinations resolving to private/internal addresses.
+
+    This protects against:
+    - localhost
+    - RFC1918 private addresses
+    - loopback
+    - link-local
+    - metadata endpoints
+    - reserved addresses
+    """
+
+    try:
+        infos = socket.getaddrinfo(
+            hostname,
+            443,
+            type=socket.SOCK_STREAM
+        )
+
+        if not infos:
+            return True
+
+        for info in infos:
+            ip_string = info[4][0]
+
+            try:
+                ip = ipaddress.ip_address(ip_string)
+
+                if (
+                    ip.is_private
+                    or ip.is_loopback
+                    or ip.is_link_local
+                    or ip.is_reserved
+                    or ip.is_multicast
+                    or ip.is_unspecified
+                ):
+                    return True
+
+            except ValueError:
+                return True
+
+        return False
+
+    except Exception:
+        return True
+
 
 def validate_url(url):
     """
-    Only exact allowed HTTPS hostnames are permitted.
-
-    Allowed:
-      https://example.com
-      https://www.iana.org
-
-    Paths, query strings, and fragments on those hosts are allowed.
-
-    Blocked:
-      http://...
-      example.com.attacker.com
-      attacker-example.com
-      example.com@attacker.com
-      user:pass@example.com
+    Validate a URL before making a request.
     """
 
     if not isinstance(url, str) or not url:
@@ -159,20 +191,20 @@ def validate_url(url):
     try:
         parsed = urlparse(url)
 
-        # Must be HTTPS.
+        # HTTPS only.
         if parsed.scheme.lower() != "https":
             return False, "Only HTTPS URLs are allowed."
 
-        # Reject userinfo.
+        # No username/password confusion.
         if parsed.username is not None:
-            return False, "URL userinfo is not permitted."
+            return False, "URL userinfo is blocked."
 
         if parsed.password is not None:
-            return False, "URL userinfo is not permitted."
+            return False, "URL userinfo is blocked."
 
         hostname = parsed.hostname
 
-        if hostname is None:
+        if not hostname:
             return False, "URL has no hostname."
 
         hostname = hostname.lower().rstrip(".")
@@ -181,6 +213,11 @@ def validate_url(url):
         if hostname not in ALLOWED_HOSTS:
             return False, "Hostname is not allowed."
 
+        # Prevent allowed-looking hostnames from resolving to
+        # private infrastructure.
+        if hostname_resolves_to_private(hostname):
+            return False, "Hostname resolves to a private address."
+
         return True, None
 
     except Exception:
@@ -188,29 +225,59 @@ def validate_url(url):
 
 
 def fetch_safe_url(url):
+    """
+    Fetch a URL while validating every redirect.
+
+    Redirect destinations must also satisfy the exact host
+    allowlist and private-address checks.
+    """
+
     valid, reason = validate_url(url)
 
     if not valid:
         return None, reason
 
+    current_url = url
+
     try:
-        response = requests.get(
-            url,
-            timeout=8,
-            allow_redirects=False,
-            headers={
-                "User-Agent": "Agent-Guardrail/1.0"
-            }
-        )
+        for _ in range(MAX_REDIRECTS + 1):
 
-        # Never follow redirects.
-        if 300 <= response.status_code < 400:
-            return None, "Redirects are blocked."
+            response = requests.get(
+                current_url,
+                timeout=8,
+                allow_redirects=False,
+                headers={
+                    "User-Agent": "Agent-Guardrail/1.0"
+                }
+            )
 
-        return response.text, None
+            # Handle redirects manually.
+            if response.is_redirect or response.is_permanent_redirect:
 
-    except requests.RequestException as e:
-        return None, f"Network request failed: {e}"
+                location = response.headers.get("Location")
+
+                if not location:
+                    return None, "Redirect has no destination."
+
+                next_url = urljoin(
+                    current_url,
+                    location
+                )
+
+                valid, reason = validate_url(next_url)
+
+                if not valid:
+                    return None, "Redirect destination is blocked."
+
+                current_url = next_url
+                continue
+
+            return response.text, None
+
+        return None, "Too many redirects."
+
+    except requests.RequestException:
+        return None, "Network request failed."
 
 
 # ============================================================
@@ -325,11 +392,16 @@ def health():
 
 
 # ============================================================
-# START
+# START LOCAL SERVER
 # ============================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
