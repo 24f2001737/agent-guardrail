@@ -288,6 +288,7 @@ def fetch_safe_url(url):
 def guardrail():
 
     data = request.get_json(silent=True)
+    print("INCOMING REQUEST:", data, flush=True)
 
     if not isinstance(data, dict):
         return jsonify({
