@@ -266,6 +266,13 @@ def fetch_safe_url(url):
                 }
             )
 
+            print(
+    "FETCH_RESULT:",
+    response.status_code,
+    response.url,
+    flush=True
+)
+
             # ------------------------------------------------
             # Redirect
             # ------------------------------------------------
@@ -425,10 +432,12 @@ def guardrail():
             })
 
         return jsonify({
-            "action": "allow",
-            "reason": "URL is permitted by the network policy.",
-            "result": content
-        })
+    "action": "allow",
+    "reason": "URL is permitted by the network policy.",
+    "result": {
+        "body": content
+    }
+})
 
 
     # ========================================================
