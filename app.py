@@ -203,14 +203,14 @@ def validate_url(url):
         return False, "Invalid URL."
 
     try:
+
         parsed = urlparse(url)
 
-        # HTTPS only
         if parsed.scheme.lower() != "https":
             return False, "Only HTTPS URLs are allowed."
 
-        # Block userinfo tricks:
-        # https://example.com@evil.com
+        # Blocks:
+        # https://example.com@169.254.169.254/
         if parsed.username is not None:
             return False, "URL userinfo is blocked."
 
@@ -224,11 +224,7 @@ def validate_url(url):
 
         hostname = hostname.lower().rstrip(".")
 
-        # EXACT hostname match.
-        # This does NOT allow:
-        # example.com.evil.com
-        # evil-example.com
-        # example.com@evil.com
+        # EXACT hostname comparison.
         if hostname not in ALLOWED_HOSTS:
             return False, "Hostname is not allowed."
 
@@ -236,7 +232,6 @@ def validate_url(url):
 
     except Exception:
         return False, "Malformed URL."
-
 
 # ============================================================
 # SAFE URL FETCH
@@ -253,8 +248,9 @@ def fetch_safe_url(url):
 
     try:
 
-        # Manually follow redirects so every destination
-        # can be checked against the allowlist.
+        # Allow a limited number of redirects.
+        # Every redirect destination is validated before
+        # another HTTP request is made.
         for _ in range(5):
 
             response = requests.get(
@@ -267,14 +263,14 @@ def fetch_safe_url(url):
             )
 
             print(
-    "FETCH_RESULT:",
-    response.status_code,
-    response.url,
-    flush=True
-)
+                "FETCH_RESULT:",
+                response.status_code,
+                current_url,
+                flush=True
+            )
 
             # ------------------------------------------------
-            # Redirect
+            # Handle HTTP redirects
             # ------------------------------------------------
 
             if 300 <= response.status_code < 400:
@@ -286,14 +282,14 @@ def fetch_safe_url(url):
                 if not location:
                     return None, "Redirect has no destination."
 
-                # Convert relative redirects into absolute URLs.
+                # Resolve relative redirect URLs.
                 next_url = urljoin(
                     current_url,
                     location
                 )
 
                 # IMPORTANT:
-                # Validate the redirect destination BEFORE
+                # Validate the redirect target BEFORE
                 # making the next request.
                 valid, reason = validate_url(
                     next_url
@@ -307,7 +303,10 @@ def fetch_safe_url(url):
                 continue
 
             # ------------------------------------------------
-            # Normal response
+            # Normal response, including 404/500.
+            #
+            # The host is allowed, so return the response
+            # regardless of HTTP status.
             # ------------------------------------------------
 
             return response.text, None
@@ -317,7 +316,6 @@ def fetch_safe_url(url):
     except requests.RequestException:
         return None, "Network request failed."
         
-
 # ============================================================
 # MAIN GUARDRAIL ENDPOINT
 # ============================================================
